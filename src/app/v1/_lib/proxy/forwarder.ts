@@ -27,6 +27,7 @@ import {
 } from "@/lib/provider-endpoints/endpoint-selector";
 import { getGlobalAgentPool, getProxyAgentForProvider } from "@/lib/proxy-agent";
 import { SessionManager } from "@/lib/session-manager";
+import { extractFirstCompleteSSEEvent } from "@/lib/utils/sse";
 import {
   detectUpstreamErrorFromSseOrJsonText,
   inferUpstreamErrorStatusCodeFromText,
@@ -139,6 +140,13 @@ type ReactiveRectifierResult =
 // - 该检查仅用于“空响应/假 200”启发式判定，不用于业务逻辑解析；
 // - 超过上限时，仍认为“非空”，但会跳过 JSON 内容结构检查（避免截断导致误判）。
 const NON_STREAM_BODY_INSPECTION_MAX_BYTES = 32 * 1024; // 32 KiB
+
+type FirstSseEventProbeResult = {
+  bufferedChunks: Uint8Array[];
+  firstEventText: string | null;
+  inspectedText: string;
+  streamEnded: boolean;
+};
 
 /**
  * 读取响应体文本，但最多读取 `maxBytes` 字节（用于非流式 2xx 的“空响应/假 200”嗅探）。
@@ -962,16 +970,49 @@ export class ProxyForwarder {
             normalizedContentType.includes("application/json") ||
             normalizedContentType.includes("+json");
 
-          // ========== 流式响应：延迟成功判定（避免“假 200”）==========
-          // 背景：上游可能返回 HTTP 200，但 SSE 内容为错误 JSON（如 {"error": "..."}）。
-          // 如果在“收到响应头”时就立刻记录 success / 更新 session 绑定：
-          // - 会把会话粘到一个实际不可用的 provider；
-          // - 熔断/故障转移统计被误记为成功；
-          // - 客户端下一次自动重试可能仍复用到同一 provider，导致“假 200”让重试失效。
-          //
-          // 解决：Forwarder 只负责尽快把 Response 返回给下游开始透传，
-          // 把最终成功/失败结算延迟到 ResponseHandler：等 SSE 正常结束后再基于最终 body 补充检查并更新内部状态。
+          // ========== 流式响应：首个完整 SSE event 门控 + 延迟结算 ===========
+          // 背景：部分上游会返回 HTTP 200，但首个完整 SSE event 实际是错误 JSON。
+          // 如果在收到 headers 后就立刻把 200 透给客户端，将失去本次请求内切 provider 的机会。
           if (isSSE) {
+            let gatedResponse = response;
+
+            if (response.status === 200 && response.body) {
+              const reader = response.body.getReader();
+              const probe = await ProxyForwarder.probeFirstSseEvent(reader);
+              ProxyForwarder.clearResponseTimeoutOnce(session as ProxySessionWithAttemptRuntime);
+
+              if (probe.bufferedChunks.length === 0) {
+                throw new EmptyResponseError(
+                  currentProvider.id,
+                  currentProvider.name,
+                  "empty_body"
+                );
+              }
+
+              const detected = detectUpstreamErrorFromSseOrJsonText(probe.inspectedText);
+              if (detected.isError) {
+                try {
+                  await reader.cancel("fake_200_first_sse_event_error");
+                } catch {
+                  // ignore
+                }
+                throw ProxyForwarder.buildDetectedFake200Error(
+                  currentProvider,
+                  probe.inspectedText,
+                  detected
+                );
+              }
+
+              gatedResponse = new Response(
+                ProxyForwarder.buildBufferedPrefixStream(probe.bufferedChunks, reader),
+                {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers,
+                }
+              );
+            }
+
             setDeferredStreamingFinalization(session, {
               providerId: currentProvider.id,
               providerName: currentProvider.name,
@@ -982,7 +1023,7 @@ export class ProxyForwarder {
               isFailoverSuccess: totalProvidersAttempted > 1,
               endpointId: activeEndpoint.endpointId,
               endpointUrl: endpointAudit.endpointUrl,
-              upstreamStatusCode: response.status,
+              upstreamStatusCode: gatedResponse.status,
             });
 
             logger.info("ProxyForwarder: Streaming response received, deferring finalization", {
@@ -990,10 +1031,10 @@ export class ProxyForwarder {
               providerName: currentProvider.name,
               attemptNumber: attemptCount,
               totalProvidersAttempted,
-              statusCode: response.status,
+              statusCode: gatedResponse.status,
             });
 
-            return response;
+            return gatedResponse;
           }
 
           // 非流式响应：检测空响应
@@ -3170,10 +3211,10 @@ export class ProxyForwarder {
           const attemptRuntime = attempt.session as ProxySessionWithAttemptRuntime;
           attempt.responseController = attemptRuntime.responseController ?? null;
           attempt.clearResponseTimeout = attemptRuntime.clearResponseTimeout ?? null;
-          attempt.clearResponseTimeout?.();
           attempt.response = response;
 
           if (!response.body) {
+            ProxyForwarder.clearResponseTimeoutOnce(attempt);
             await handleAttemptFailure(
               attempt,
               new EmptyResponseError(attempt.provider.id, attempt.provider.name, "empty_body")
@@ -3184,7 +3225,45 @@ export class ProxyForwarder {
           attempt.reader = response.body.getReader();
 
           try {
+            const normalizedContentType = (
+              response.headers.get("content-type") || ""
+            ).toLowerCase();
+            const shouldGateFirstSseEvent =
+              response.status === 200 && normalizedContentType.includes("text/event-stream");
+
+            if (shouldGateFirstSseEvent) {
+              const probe = await ProxyForwarder.probeFirstSseEvent(attempt.reader);
+              ProxyForwarder.clearResponseTimeoutOnce(attempt);
+
+              if (probe.bufferedChunks.length === 0) {
+                await handleAttemptFailure(
+                  attempt,
+                  new EmptyResponseError(attempt.provider.id, attempt.provider.name, "empty_body")
+                );
+                return;
+              }
+
+              const detected = detectUpstreamErrorFromSseOrJsonText(probe.inspectedText);
+              if (detected.isError) {
+                ProxyForwarder.cancelAttemptStream(attempt, "fake_200_first_sse_event_error");
+                await handleAttemptFailure(
+                  attempt,
+                  ProxyForwarder.buildDetectedFake200Error(
+                    attempt.provider,
+                    probe.inspectedText,
+                    detected
+                  )
+                );
+                return;
+              }
+
+              await commitWinner(attempt, probe.bufferedChunks);
+              return;
+            }
+
             const firstChunk = await ProxyForwarder.readFirstReadableChunk(attempt.reader);
+            ProxyForwarder.clearResponseTimeoutOnce(attempt);
+
             if (firstChunk.done) {
               await handleAttemptFailure(
                 attempt,
@@ -3193,13 +3272,14 @@ export class ProxyForwarder {
               return;
             }
 
-            await commitWinner(attempt, firstChunk.value);
+            await commitWinner(attempt, [firstChunk.value]);
           } catch (firstChunkError) {
             const normalizedError =
               firstChunkError instanceof Error
                 ? firstChunkError
                 : new Error(String(firstChunkError));
             if (settled || winnerCommitted) return;
+            ProxyForwarder.clearResponseTimeoutOnce(attempt);
             await handleAttemptFailure(attempt, normalizedError);
           }
         })
@@ -3357,7 +3437,7 @@ export class ProxyForwarder {
       await finishIfExhausted();
     };
 
-    const commitWinner = async (attempt: StreamingHedgeAttempt, firstChunk: Uint8Array) => {
+    const commitWinner = async (attempt: StreamingHedgeAttempt, bufferedPrefix: Uint8Array[]) => {
       if (settled || winnerCommitted || attempt.settled || !attempt.response || !attempt.reader)
         return;
 
@@ -3443,7 +3523,7 @@ export class ProxyForwarder {
       });
 
       const response = new Response(
-        ProxyForwarder.buildBufferedFirstChunkStream(firstChunk, attempt.reader),
+        ProxyForwarder.buildBufferedPrefixStream(bufferedPrefix, attempt.reader),
         {
           status: attempt.response.status,
           statusText: attempt.response.statusText,
@@ -3809,26 +3889,65 @@ export class ProxyForwarder {
       if (result.done) {
         return result;
       }
-      // Skip zero-length chunks: some upstream providers (e.g. behind proxies/load-balancers)
-      // may emit empty chunks as keep-alive or framing artifacts. These carry no payload and
-      // must be silently skipped to avoid treating them as a valid "first byte" event.
       if (result.value && result.value.byteLength > 0) {
         return result;
       }
     }
   }
 
-  private static buildBufferedFirstChunkStream(
-    firstChunk: Uint8Array,
+  private static async probeFirstSseEvent(
+    reader: ReadableStreamDefaultReader<Uint8Array>
+  ): Promise<FirstSseEventProbeResult> {
+    const decoder = new TextDecoder();
+    const bufferedChunks: Uint8Array[] = [];
+    let bufferedText = "";
+
+    while (true) {
+      const result = await reader.read();
+      if (result.done) {
+        const flushed = decoder.decode();
+        if (flushed) {
+          bufferedText += flushed;
+        }
+
+        return {
+          bufferedChunks,
+          firstEventText: extractFirstCompleteSSEEvent(bufferedText),
+          inspectedText: bufferedText,
+          streamEnded: true,
+        };
+      }
+
+      if (!result.value || result.value.byteLength === 0) {
+        continue;
+      }
+
+      bufferedChunks.push(result.value);
+      bufferedText += decoder.decode(result.value, { stream: true });
+
+      const firstEventText = extractFirstCompleteSSEEvent(bufferedText);
+      if (firstEventText) {
+        return {
+          bufferedChunks,
+          firstEventText,
+          inspectedText: firstEventText,
+          streamEnded: false,
+        };
+      }
+    }
+  }
+
+  private static buildBufferedPrefixStream(
+    prefixChunks: Uint8Array[],
     reader: ReadableStreamDefaultReader<Uint8Array>
   ): ReadableStream<Uint8Array> {
-    let firstChunkSent = false;
+    let prefixIndex = 0;
 
     return new ReadableStream<Uint8Array>({
       async pull(controller) {
-        if (!firstChunkSent) {
-          firstChunkSent = true;
-          controller.enqueue(firstChunk);
+        if (prefixIndex < prefixChunks.length) {
+          controller.enqueue(prefixChunks[prefixIndex] as Uint8Array);
+          prefixIndex += 1;
           return;
         }
 
@@ -3848,6 +3967,49 @@ export class ProxyForwarder {
           // ignore
         }
       },
+    });
+  }
+
+  private static clearResponseTimeoutOnce(target: {
+    clearResponseTimeout?: (() => void) | null;
+  }): void {
+    target.clearResponseTimeout?.();
+    target.clearResponseTimeout = null;
+  }
+
+  private static buildDetectedFake200Error(
+    provider: Pick<Provider, "id" | "name">,
+    rawBody: string,
+    detected: Exclude<ReturnType<typeof detectUpstreamErrorFromSseOrJsonText>, { isError: false }>
+  ): Error {
+    if (detected.code === "FAKE_200_EMPTY_BODY") {
+      return new EmptyResponseError(provider.id, provider.name, "empty_body");
+    }
+
+    const inferredStatus = inferUpstreamErrorStatusCodeFromText(rawBody);
+    const inferredStatusCode = inferredStatus?.statusCode;
+
+    return new ProxyError(detected.code, inferredStatusCode ?? 502, {
+      body: detected.detail ?? "",
+      providerId: provider.id,
+      providerName: provider.name,
+      rawBody,
+      rawBodyTruncated: false,
+      statusCodeInferred: inferredStatusCode !== undefined,
+      statusCodeInferenceMatcherId: inferredStatus?.matcherId,
+    });
+  }
+
+  private static cancelAttemptStream(attempt: StreamingHedgeAttempt, reason: string): void {
+    try {
+      attempt.responseController?.abort(new Error(reason));
+    } catch {
+      // ignore
+    }
+
+    const cancelPromise = attempt.reader?.cancel(reason);
+    cancelPromise?.catch(() => {
+      // ignore
     });
   }
 

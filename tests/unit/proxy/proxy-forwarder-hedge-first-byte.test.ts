@@ -218,6 +218,7 @@ function createStreamingResponse(params: {
   label: string;
   firstChunkDelayMs: number;
   controller: AbortController;
+  firstChunkText?: string;
 }): Response {
   const encoder = new TextEncoder();
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -242,7 +243,9 @@ function createStreamingResponse(params: {
           controller.close();
           return;
         }
-        controller.enqueue(encoder.encode(`data: {"provider":"${params.label}"}\n\n`));
+        controller.enqueue(
+          encoder.encode(params.firstChunkText ?? `data: {"provider":"${params.label}"}\n\n`)
+        );
         controller.close();
       }, params.firstChunkDelayMs);
     },
@@ -711,6 +714,71 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
       expect(mocks.recordSuccess).not.toHaveBeenCalled();
       expect(session.provider?.id).toBe(2);
       expect(mocks.updateSessionBindingSmart).toHaveBeenCalledWith("sess-hedge", 2, 0, false, true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("首个 provider 的首个完整 SSE event 为 error 时，应直接切换到下一个 provider", async () => {
+    vi.useFakeTimers();
+
+    try {
+      const provider1 = createProvider({ id: 1, name: "p1", firstByteTimeoutStreamingMs: 100 });
+      const provider2 = createProvider({ id: 2, name: "p2", firstByteTimeoutStreamingMs: 100 });
+      const session = createSession();
+      session.setProvider(provider1);
+
+      mocks.pickRandomProviderWithExclusion.mockResolvedValueOnce(provider2);
+
+      const doForward = vi.spyOn(
+        ProxyForwarder as unknown as {
+          doForward: (...args: unknown[]) => Promise<Response>;
+        },
+        "doForward"
+      );
+
+      const controller1 = new AbortController();
+      const controller2 = new AbortController();
+
+      doForward.mockImplementationOnce(async (attemptSession) => {
+        const runtime = attemptSession as ProxySession & AttemptRuntime;
+        runtime.responseController = controller1;
+        runtime.clearResponseTimeout = vi.fn();
+        return createStreamingResponse({
+          label: "p1",
+          firstChunkDelayMs: 40,
+          controller: controller1,
+          firstChunkText: 'data: {"error":"upstream blocked"}\n\n',
+        });
+      });
+
+      doForward.mockImplementationOnce(async (attemptSession) => {
+        const runtime = attemptSession as ProxySession & AttemptRuntime;
+        runtime.responseController = controller2;
+        runtime.clearResponseTimeout = vi.fn();
+        return createStreamingResponse({
+          label: "p2",
+          firstChunkDelayMs: 40,
+          controller: controller2,
+        });
+      });
+
+      const responsePromise = ProxyForwarder.send(session);
+
+      await vi.advanceTimersByTimeAsync(40);
+      expect(doForward).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(40);
+      const response = await responsePromise;
+      expect(await response.text()).toContain('"provider":"p2"');
+      expect(controller1.signal.aborted).toBe(true);
+      expect(controller2.signal.aborted).toBe(false);
+      expect(mocks.recordFailure).toHaveBeenCalledWith(
+        1,
+        expect.objectContaining({ message: "FAKE_200_JSON_ERROR_NON_EMPTY" })
+      );
+      expect(session.provider?.id).toBe(2);
+      expect(mocks.pickRandomProviderWithExclusion).toHaveBeenCalledWith(session, [1]);
     } finally {
       vi.useRealTimers();
     }

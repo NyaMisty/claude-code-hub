@@ -65,6 +65,62 @@ export function parseSSEData(sseText: string): ParsedSSEEvent[] {
 }
 
 /**
+ * 从增量 SSE 文本中提取首个“完整且包含 data 行”的事件。
+ *
+ * 说明：
+ * - 只在遇到空行时认定事件完成；不会像 parseSSEData 一样在 EOF 强制 flush。
+ * - 会忽略前置 comment/keep-alive 与不含 data 的空事件块。
+ * - 返回值仅用于首事件门控检测，不用于重建原始字节流。
+ */
+export function extractFirstCompleteSSEEvent(sseText: string): string | null {
+  let blockLines: string[] = [];
+  let hasDataLine = false;
+
+  const flushEvent = () => {
+    if (!hasDataLine) {
+      blockLines = [];
+      hasDataLine = false;
+      return null;
+    }
+
+    const eventText = `${blockLines.join("\n")}\n\n`;
+    blockLines = [];
+    hasDataLine = false;
+    return eventText;
+  };
+
+  const lines = sseText.split("\n");
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const rawLine = lines[index] ?? "";
+    const line = rawLine.trimEnd();
+
+    if (!line) {
+      const eventText = flushEvent();
+      if (eventText) {
+        return eventText;
+      }
+      continue;
+    }
+
+    if (line.startsWith(":")) {
+      if (blockLines.length > 0) {
+        blockLines.push(rawLine);
+      }
+      continue;
+    }
+
+    if (line.startsWith("data:")) {
+      hasDataLine = true;
+    }
+
+    blockLines.push(rawLine);
+  }
+
+  return null;
+}
+
+/**
  * 严格检测文本是否“看起来像” SSE。
  *
  * 只认行首的 `event:` / `data:`（或前置注释行 `:`），避免 JSON 里包含 "data:" 误判。

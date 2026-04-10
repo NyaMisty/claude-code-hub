@@ -1,5 +1,10 @@
 import { describe, expect, test } from "vitest";
-import { isSSEText, parseSSEData, parseSSEDataForDisplay } from "./sse";
+import {
+  extractFirstCompleteSSEEvent,
+  isSSEText,
+  parseSSEData,
+  parseSSEDataForDisplay,
+} from "./sse";
 
 describe("sse utils", () => {
   test("isSSEText detects standard SSE by line prefixes", () => {
@@ -64,5 +69,29 @@ describe("sse utils", () => {
       [": keep-alive", "event: e", "data: 1", "", ""].join("\n")
     );
     expect(events).toEqual([{ event: "e", data: 1 }]);
+  });
+
+  test("extractFirstCompleteSSEEvent 只返回首个完整 data 事件", () => {
+    const event = extractFirstCompleteSSEEvent(
+      [
+        ": keep-alive",
+        "event: message_start",
+        'data: {"ok":1}',
+        "",
+        "event: message_delta",
+        'data: {"error":"later"}',
+        "",
+      ].join("\n")
+    );
+
+    expect(event).toBe(["event: message_start", 'data: {"ok":1}', "", ""].join("\n"));
+  });
+
+  test("extractFirstCompleteSSEEvent 在首事件未完整结束时返回 null", () => {
+    const event = extractFirstCompleteSSEEvent(
+      [": keep-alive", "event: message", 'data: {"ok":1}'].join("\n")
+    );
+
+    expect(event).toBeNull();
   });
 });

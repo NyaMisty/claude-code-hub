@@ -193,6 +193,15 @@ function createSession(): ProxySession {
   return session as ProxySession;
 }
 
+function createSseResponse(body: string): Response {
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream",
+    },
+  });
+}
+
 describe("ProxyForwarder - fake 200 HTML body", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -534,6 +543,88 @@ describe("ProxyForwarder - fake 200 HTML body", () => {
     );
     expect(mocks.recordSuccess).toHaveBeenCalledWith(2);
     expect(mocks.recordSuccess).not.toHaveBeenCalledWith(1);
+  });
+
+  test("200 + SSE 首个完整 event 为 error 时应切换供应商", async () => {
+    const provider1 = createProvider({
+      id: 1,
+      name: "p1",
+      key: "k1",
+      maxRetryAttempts: 1,
+      firstByteTimeoutStreamingMs: 0,
+    });
+    const provider2 = createProvider({
+      id: 2,
+      name: "p2",
+      key: "k2",
+      maxRetryAttempts: 1,
+      firstByteTimeoutStreamingMs: 0,
+    });
+
+    const session = createSession();
+    session.request.message.stream = true;
+    session.setProvider(provider1);
+
+    mocks.pickRandomProviderWithExclusion.mockResolvedValueOnce(provider2);
+
+    const doForward = vi.spyOn(ProxyForwarder as any, "doForward");
+
+    doForward.mockResolvedValueOnce(
+      createSseResponse(['data: {"error":"upstream blocked"}', ""].join("\n"))
+    );
+    doForward.mockResolvedValueOnce(
+      createSseResponse(['data: {"provider":"p2"}', 'data: {"done":true}', ""].join("\n"))
+    );
+
+    const response = await ProxyForwarder.send(session);
+    expect(await response.text()).toContain('"provider":"p2"');
+
+    expect(doForward).toHaveBeenCalledTimes(2);
+    expect(mocks.pickRandomProviderWithExclusion).toHaveBeenCalledWith(session, [1]);
+    expect(mocks.recordFailure).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({ message: "FAKE_200_JSON_ERROR_NON_EMPTY" })
+    );
+    expect(mocks.recordSuccess).not.toHaveBeenCalledWith(1);
+    expect(mocks.recordSuccess).not.toHaveBeenCalledWith(2);
+  });
+
+  test("200 + SSE 仅拦截首个完整 event，后续 error event 不触发当前请求切换", async () => {
+    const provider1 = createProvider({
+      id: 1,
+      name: "p1",
+      key: "k1",
+      maxRetryAttempts: 1,
+      firstByteTimeoutStreamingMs: 0,
+    });
+
+    const session = createSession();
+    session.request.message.stream = true;
+    session.setProvider(provider1);
+
+    const doForward = vi.spyOn(ProxyForwarder as any, "doForward");
+
+    doForward.mockResolvedValueOnce(
+      createSseResponse(
+        [
+          "event: message_start",
+          'data: {"provider":"p1"}',
+          "",
+          "event: message_delta",
+          'data: {"error":"later"}',
+          "",
+        ].join("\n")
+      )
+    );
+
+    const response = await ProxyForwarder.send(session);
+    const body = await response.text();
+
+    expect(body).toContain('"provider":"p1"');
+    expect(body).toContain('"error":"later"');
+    expect(doForward).toHaveBeenCalledTimes(1);
+    expect(mocks.pickRandomProviderWithExclusion).not.toHaveBeenCalled();
+    expect(mocks.recordFailure).not.toHaveBeenCalled();
   });
 });
 
